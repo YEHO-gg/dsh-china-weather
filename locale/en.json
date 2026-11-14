@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "China Weather",
+    "description": "Looks up live weather and 1-7 day forecasts in China, either from the host's public IP or a city/district name. Free, no API key."
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@local/china-weather",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "description": "中国境内天气查询：自动 IP 定位或指定地区，免费公开数据源，无需 API 密钥。",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "weather.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

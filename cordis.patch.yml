@@ -1,0 +1,4 @@
+- insert:
+    - id: china-weather
+      name: '@local/china-weather'
+      config: {}
