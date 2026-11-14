@@ -9,19 +9,20 @@
 
 ## 安装
 
-和普通 DSH 插件一样，两种方式任选：
-
-**本地目录**（开发调试用）
+直接用 DSH 的插件安装命令：
 
 ```bash
-# 放进任意目录后，在 DSH profile 里 link 进来
+dsh plugin add https://github.com/YEHO-gg/dsh-china-weather
+```
+
+或者手工 link（开发调试用）：
+
+```bash
 cd %USERPROFILE%\.dsh\profiles\desktop
 pnpm add link:<本仓库路径>
 ```
 
-然后在 profile 的 `package.json` → `dsh.profile.bundles` 里加上 `"@local/china-weather"`，重启 DSH。
-
-**插件市场**：仓库尚未发布到 npm，暂不支持。
+然后在 profile 的 `package.json` → `dsh.profile.bundles` 里加上 `"dsh-china-weather"`，重启 DSH。
 
 > 本插件不需要任何 API 密钥，不需要配置文件。
 

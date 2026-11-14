@@ -1,9 +1,25 @@
 {
-  "name": "@local/china-weather",
+  "name": "dsh-china-weather",
   "version": "1.0.1",
-  "private": true,
   "type": "module",
   "description": "中国境内天气查询：自动 IP 定位或指定地区，免费公开数据源，无需 API 密钥。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "weather",
+    "china",
+    "forecast"
+  ],
+  "license": "MIT",
+  "author": "YEHO-gg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YEHO-gg/dsh-china-weather.git"
+  },
+  "homepage": "https://github.com/YEHO-gg/dsh-china-weather#readme",
+  "bugs": {
+    "url": "https://github.com/YEHO-gg/dsh-china-weather/issues"
+  },
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
@@ -15,7 +31,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
