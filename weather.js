@@ -15,6 +15,40 @@ const AIR_ENDPOINT = 'https://air-quality-api.open-meteo.com/v1/air-quality';
 const IPIP_ENDPOINT = 'https://myip.ipip.net/json';
 const IPWHO_ENDPOINT = 'https://ipwho.is/';
 
+/**
+ * 地名类型权重（2026-11-17 加）。
+ *
+ * 起因：`天门` 在 Photon 里能搜到 7 个同名条目，分别是
+ *   天门市/湖北省(place/city) · 天门/新疆(tourism/attraction) · 天门/浙江(natural/peak)
+ *   天门/安徽(place/village) · 天门/江西(place/hamlet) · 天门/浙江(place/locality)
+ *   天门镇/安徽(place/town)
+ * normalizeName 会把 `天门市` 规约成 `天门`，于是这 7 条 **nameScore 全是 100**，
+ * 排序只能靠 Photon 的返回顺序——这次恰好对，但那是运气，不是逻辑。
+ *
+ * 加这张表之后：城市级 > 镇 > 县/区 > 村 > 自然/旅游要素。
+ * 「天门」现在由 place/city 稳定胜出（130 分 vs 75 分），不再依赖运气。
+ */
+const SETTLEMENT_RANK = new Map([
+  ['city', 30],
+  ['municipality', 30],
+  ['county', 26],
+  ['borough', 14],
+  ['town', 20],
+  ['district', 16],
+  ['suburb', 12],
+  ['village', 8],
+  ['hamlet', 5],
+  ['locality', 4],
+  ['quarter', 3],
+  ['neighbourhood', 2],
+]);
+
+/** 非居民点（山、景点、桥……）在"查天气"这个语境里是噪音，扣分 */
+const NON_SETTLEMENT_PENALTY = 25;
+
+const AMAP_ENDPOINT = 'https://restapi.amap.com/v3/geocode/geo';
+const AMAP_TIMEOUT_MS = 8_000;
+
 const USER_AGENT = 'dsh-weather-cn/1.0 (personal weather tool)';
 const CHINA_CODES = new Set(['CN', 'HK', 'MO', 'TW']);
 const CACHE_TTL_MS = 10 * 60 * 1000;
@@ -220,7 +254,14 @@ function scoreFeature(feature, query, candidates, context, bias) {
   if (name && queryName && name === queryName) nameScore = 100;
   else if (placeLike && name && queryName && (name.includes(queryName) || queryName.includes(name))) nameScore = 35;
 
-  let score = nameScore;
+  // ★ 2026-11-17：按地名要素类型排名。城市级压倒性胜出，山头/景点/桥被压下去。
+  //   boundary/administrative（行政区边界）没有 osm_value 可查，按区县级 16 分算 ——
+  //   否则「北京市朝阳区」这种正确结果会因为 rank=0 被误判成低置信度。
+  const rank = placeLike
+    ? (SETTLEMENT_RANK.get(String(props.osm_value)) ?? (props.osm_key === 'boundary' ? 16 : 0))
+    : 0;
+  let score = nameScore + rank;
+  if (rank === 0 && nameScore > 0) score -= NON_SETTLEMENT_PENALTY;
 
   for (const other of candidates) {
     const token = normalizeName(other);
@@ -240,7 +281,7 @@ function scoreFeature(feature, query, candidates, context, bias) {
     }
   }
 
-  return { score, nameScore };
+  return { score, nameScore, rank };
 }
 
 function featureToPlace(feature) {
@@ -289,7 +330,8 @@ async function geocodeOpenMeteo(raw, signal) {
   if (ranked[0].exact === 0) return undefined;
 
   const best = ranked[0].item;
-  const pieces = [best.admin1, best.admin2].filter(Boolean);
+  // 去重：直辖市经常 admin1 和 admin2 都返回"上海市"，拼出来会变成「上海市上海市」。
+  const pieces = [...new Set([best.admin1, best.admin2].filter(Boolean))];
   if (!pieces.some((part) => part.includes(best.name))) pieces.push(best.name);
 
   return {
@@ -309,6 +351,79 @@ async function geocodeOpenMeteo(raw, signal) {
 /** 剥掉仅供内部置信度判断的字段 */
 const withoutPopulation = ({ population, ...place }) => place;
 
+/**
+ * 高德地理编码（可选路径，默认关闭）。
+ *
+ * 中国境内县级市/乡镇的数据质量明显好于 OpenStreetMap 系（Photon 里宜昌的
+ * 县级市也会缺人口、同名村一堆）。但高德要免费 key，所以做成"配了才走"：
+ * 环境变量 `AMAP_KEY` 有值就优先用它，没配就整段跳过，不影响其它路径。
+ *
+ * 注册：https://lbs.amap.com/ → 控制台 → 应用管理 → 添加 Key → Web服务
+ */
+/** 省级名称（用于从裸地名里榨出"用户其实说了哪个省"这条线索） */
+const PROVINCE_NAMES = [
+  '北京', '天津', '上海', '重庆', '河北', '山西', '辽宁', '吉林', '黑龙江',
+  '江苏', '浙江', '安徽', '福建', '江西', '山东', '河南', '湖北', '湖南',
+  '广东', '海南', '四川', '贵州', '云南', '陕西', '甘肃', '青海', '台湾',
+  '内蒙古', '广西', '西藏', '宁夏', '新疆', '香港', '澳门',
+];
+
+/**
+ * 从用户输入里找省级线索。
+ * 「北京市朝阳区」→ 北京（于是海淀/朝阳这种同名区能按省份定死）
+ * 「湖北省天门市」→ 湖北
+ * 「天门」        → ''（没有线索，只能靠地名等级猜）
+ */
+function detectProvince(raw) {
+  const text = String(raw ?? '');
+  // 长的优先，避免"海南"被"南"之类误伤（这里没有单字项，但保持稳妥）
+  let best = '';
+  for (const name of PROVINCE_NAMES) {
+    if (text.includes(name) && name.length > best.length) best = name;
+  }
+  return best;
+}
+
+async function geocodeAmap(raw, signal) {
+  const key = String(process.env.AMAP_KEY ?? '').trim();
+  if (!key) return undefined;
+
+  const url = new URL(AMAP_ENDPOINT);
+  url.searchParams.set('address', raw);
+  url.searchParams.set('key', key);
+  url.searchParams.set('output', 'JSON');
+
+  const data = await fetchJson(url, { signal, timeoutMs: AMAP_TIMEOUT_MS });
+  if (String(data?.status ?? '') !== '1') return undefined;
+  const first = Array.isArray(data?.geocodes) ? data.geocodes[0] : undefined;
+  if (!first) return undefined;
+
+  const [lngRaw, latRaw] = String(first.location ?? '').split(',');
+  const longitude = Number(lngRaw);
+  const latitude = Number(latRaw);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return undefined;
+
+  // 高德对直辖市会把 city 返回成 []（数组），这里统一兜成空串。
+  const province = Array.isArray(first.province) ? '' : String(first.province ?? '');
+  const city = Array.isArray(first.city) ? '' : String(first.city ?? '');
+  const district = Array.isArray(first.district) ? '' : String(first.district ?? '');
+  const pieces = [province, city, district].filter((p, i, all) => p && all.indexOf(p) === i);
+  const display = pieces.join('') || String(first.formatted_address ?? raw);
+  const name = String(district || city || province || raw).replace(/(市|区|县|旗|盟)$/, '');
+
+  return {
+    name,
+    admin1: province,
+    admin2: city || district,
+    display,
+    latitude,
+    longitude,
+    countryCode: 'CN',
+    geocoder: 'amap',
+    confidence: 'high',
+  };
+}
+
 async function geocode(raw, { context, bias, signal } = {}) {
   const cacheKey = `geo:${normalizeName(raw) || raw.toLowerCase()}:${context?.province ?? ''}:${
     bias ? `${bias.latitude?.toFixed(1)},${bias.longitude?.toFixed(1)}` : ''
@@ -319,7 +434,16 @@ async function geocode(raw, { context, bias, signal } = {}) {
   const candidates = placeCandidates(raw);
   if (!candidates.length) throw new Error('地区名无效，请提供中国境内的城市或区县名称。');
 
-  // Fast path: Open-Meteo answers common city names in about a second.
+  // 用户输入里如果带了省名（「北京市朝阳区」「湖北省天门市」），那就是最硬的消歧线索：
+  // 命中该省的候选 +20 分，且最终置信度直接判 high —— 人家已经说清楚了，不该再提示"有歧义"。
+  const provinceHint = detectProvince(raw);
+  const effectiveContext = context ?? (provinceHint ? { province: provinceHint } : undefined);
+
+  // ⓪ 高德（配了 AMAP_KEY 才走）：中国境内最准，直接采信。
+  const amap = await geocodeAmap(raw, signal).catch(() => undefined);
+  if (amap) return cacheSet(cacheKey, amap);
+
+  // ① 快路径：Open-Meteo 常见城市名 ~1 秒返回。
   const fallbackPromise = geocodeOpenMeteo(raw, signal).catch(() => undefined);
   const fast = await withTimeout(fallbackPromise, FAST_GEOCODE_MS, 'fast geocode timeout').catch(
     () => undefined,
@@ -330,7 +454,15 @@ async function geocode(raw, { context, bias, signal } = {}) {
   //   于是第一条（黑龙江那个村子）就被当成答案。
   //   Photon 那边 `天门市 / 湖北省` 恰好是第一条，所以：fast 结果人口为 0 = 不可信，
   //   交给 Photon 走完整打分；Photon 也不行时再退回 fast（见下面的 fallback）。
-  if (fast && fast.population > 0) return cacheSet(cacheKey, withoutPopulation(fast));
+  if (fast && fast.population > 0) {
+    const place = withoutPopulation(fast);
+    // 人口 > 5 万才算有分量的城市；几千人的镇子给 medium，跟用户说一声更保险。
+    return cacheSet(cacheKey, {
+      ...place,
+      geocoder: 'open-meteo',
+      confidence: fast.population >= 50_000 ? 'high' : 'medium',
+    });
+  }
 
   const collected = [];
   let sawForeign = false;
@@ -352,9 +484,16 @@ async function geocode(raw, { context, bias, signal } = {}) {
 
       const china = features.filter((feature) => isChinaCode(feature.properties?.countrycode));
       china.forEach((feature, index) => {
-        const scored = scoreFeature(feature, query, candidates, context, bias);
+        const scored = scoreFeature(feature, query, candidates, effectiveContext, bias);
         if (scored.nameScore > 0) {
-          collected.push({ feature, query, index, score: scored.score, nameScore: scored.nameScore });
+          collected.push({
+            feature,
+            query,
+            index,
+            score: scored.score,
+            nameScore: scored.nameScore,
+            rank: scored.rank,
+          });
         }
       });
 
@@ -366,7 +505,14 @@ async function geocode(raw, { context, bias, signal } = {}) {
 
   if (collected.length === 0 && !sawForeign) {
     const fallback = await fallbackPromise;
-    if (fallback) return cacheSet(cacheKey, withoutPopulation(fallback));
+    if (fallback) {
+      // ★ 这条是"两条正路都断了"的兜底：结果可能错，所以必须标 low 并让人看见。
+      return cacheSet(cacheKey, {
+        ...withoutPopulation(fallback),
+        geocoder: 'open-meteo',
+        confidence: 'low',
+      });
+    }
   }
 
   if (!collected.length) {
@@ -381,7 +527,53 @@ async function geocode(raw, { context, bias, signal } = {}) {
 
   collected.sort((left, right) => right.score - left.score || left.index - right.index);
   const best = collected[0];
-  return cacheSet(cacheKey, featureToPlace(best.feature));
+  const runner = collected[1];
+  const gap = runner ? best.score - runner.score : Number.POSITIVE_INFINITY;
+
+  // 置信度：同名的往往是"市 vs 村/景点"，所以看的是**地名等级差**，不是总分差。
+  //   天门  → 天门市(城市 30) vs 天门(村 8)      → 差 22 ⇒ high
+  //   两个同名地级市互不相让                     → 差 0  ⇒ low（提示带上省份）
+  const runnerRank = runner ? runner.rank : 0;
+  const rankLead = best.rank - runnerRank;
+  let confidence;
+  if (best.rank >= 26 && (rankLead >= 10 || gap >= 40)) confidence = 'high';
+  else if (best.rank >= 16 && (rankLead >= 4 || gap >= 25)) confidence = 'medium';
+  else confidence = 'low';
+
+  // 用户自己写了省名、而且赢家确实在这个省 ⇒ 他都说清楚了，别再提示"有歧义"。
+  const winnerProvince = normalizeName(best.feature?.properties?.state ?? '');
+  if (process.env.GEO_DBG) {
+    console.error('DBG', JSON.stringify({
+      provinceHint, winnerProvince, rank: best.rank, runnerRank, gap,
+      osm: `${best.feature?.properties?.osm_key}/${best.feature?.properties?.osm_value}`,
+      state: best.feature?.properties?.state,
+      top: collected.slice(0, 4).map((c) => ({ n: c.feature.properties?.name, s: c.score, r: c.rank, st: c.feature.properties?.state })),
+    }));
+  }
+
+  // 「省份对上了」不能只看 state —— 北京的朝阳区在 Photon 里 state 是空的，
+  // 省名藏在 city/county 里。四个行政字段任何一个命中都算。
+  const winnerFields = [
+    best.feature?.properties?.state,
+    best.feature?.properties?.city,
+    best.feature?.properties?.county,
+    best.feature?.properties?.district,
+  ]
+    .map(normalizeName)
+    .filter(Boolean);
+  if (provinceHint && best.rank >= 12) {
+    const want = normalizeName(provinceHint);
+    if (winnerFields.some((f) => f.includes(want))) confidence = 'high';
+  }
+  if (provinceHint && winnerProvince.includes(normalizeName(provinceHint)) && best.rank >= 12) {
+    confidence = 'high';
+  }
+
+  return cacheSet(cacheKey, {
+    ...featureToPlace(best.feature),
+    geocoder: 'photon',
+    confidence,
+  });
 }
 
 async function fetchIpip() {
@@ -570,6 +762,8 @@ function buildValue({ input, place, forecast, air }) {
       longitude: place.longitude,
       timezone: forecast.timezone ?? '',
       source: place.source ?? 'name',
+      geocoder: place.geocoder ?? '',
+      confidence: place.confidence ?? 'high',
     },
     note: place.note,
     current: {
@@ -614,6 +808,9 @@ export function renderWeather(value) {
   const lines = [];
 
   lines.push(`📍 ${location.display || '未知地区'}${location.source === 'ip' ? '（本机 IP 自动定位）' : ''}`);
+  if (location.confidence === 'low' && location.source !== 'ip') {
+    lines.push('⚠️ 这个地名有同名地点，上面是按"城市>镇>村"的强弱挑的最优解。如果不对，用「省+市」再查一次（例：湖北省天门市）。');
+  }
   lines.push(`🕘 ${String(current.time ?? '时间未知').replace('T', ' ')}（${location.timezone || '当地时间'}）`);
   if (value.note) lines.push(`ℹ️ ${value.note}`);
 
@@ -639,7 +836,12 @@ export function renderWeather(value) {
     daily.forEach((day, index) => lines.push(lineForDay(day, index)));
   }
 
-  lines.push('', '数据来源：Open-Meteo / Photon（免费、无需 API 密钥）');
+  const geocoderLabel = {
+    amap: '高德',
+    photon: 'Photon / OpenStreetMap',
+    'open-meteo': 'Open-Meteo',
+  }[location.geocoder] ?? 'Open-Meteo / Photon';
+  lines.push('', `数据来源：天气 Open-Meteo，地名 ${geocoderLabel}（均免费）`);
   return lines.join('\n');
 }
 

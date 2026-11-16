@@ -1,6 +1,6 @@
 {
   "name": "dsh-china-weather",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "type": "module",
   "description": "中国境内天气查询：自动 IP 定位或指定地区，免费公开数据源，无需 API 密钥。",
   "keywords": [

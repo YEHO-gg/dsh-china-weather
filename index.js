@@ -13,7 +13,9 @@ const parameters = {
     location: {
       type: 'string',
       description:
-        '中国境内地区名，如“杭州”“北京市朝阳区”“乌鲁木齐”。省略时自动按本机公网 IP 定位；不接受中国境外地区。',
+        '中国境内地区名。**强烈建议写「省+市/县」全称**，如“湖北省天门市”“浙江省杭州市”“北京市朝阳区”。' +
+        '只写裸地名（如“天门”“朝阳”）会有同名地点，工具只能按「城市>镇>村」的强弱猜一个，可能猜错；' +
+        '结果里的 location.confidence 为 low 时表示它就是猜的。省略则自动按本机公网 IP 定位。不接受中国境外地区。',
     },
     days: {
       type: 'integer',
@@ -47,6 +49,14 @@ const outputSchema = {
         longitude: { type: 'number' },
         timezone: { type: 'string' },
         source: { type: 'string' },
+        geocoder: {
+          type: 'string',
+          description: '这次地名解析用的是哪个来源：amap（高德，需 AMAP_KEY）/ photon / open-meteo',
+        },
+        confidence: {
+          type: 'string',
+          description: '地名有多确定：high / medium / low。low 表示同名歧义，结果可能是猜的。',
+        },
       },
       required: ['display', 'latitude', 'longitude'],
     },
@@ -110,7 +120,7 @@ const outputSchema = {
 const tool = {
   name: 'weather',
   description:
-    '查询中国境内（含港澳台）的实时天气与未来 1-7 天预报。省略 location 时自动按本机公网 IP 定位，也可指定城市或区县（如“杭州”“北京市朝阳区”“乌鲁木齐”）。返回实况（气温、体感、湿度、降水、风力）、日出日落、紫外线、逐日预报和空气质量。数据来自免费公开服务（Open-Meteo、Photon），无需 API 密钥；中国境外地区会返回错误。当用户询问天气、气温、下雨、穿衣或出行建议时优先调用。',
+    '查询中国境内（含港澳台）的实时天气与未来 1-7 天预报。省略 location 时自动按本机公网 IP 定位；也可指定地区——**请优先传「省+市/县」全称（如“湖北省天门市”）**，裸地名有同名歧义。返回实况（气温、体感、湿度、降水、风力）、日出日落、紫外线、逐日预报和空气质量，以及 location.geocoder（这次用的是哪个地理库）和 location.confidence（地名有多确定）。数据来自免费公开服务（Open-Meteo、Photon/OSM），无需 API 密钥；中国境外地区会返回错误。当用户询问天气、气温、下雨、穿衣或出行建议时优先调用。',
   parameters,
   output: {
     schema: outputSchema,
