@@ -300,8 +300,14 @@ async function geocodeOpenMeteo(raw, signal) {
     latitude: best.latitude,
     longitude: best.longitude,
     countryCode: best.country_code,
+    // ★ 2026-11-17：把人口带出来当作"这条路可信吗"的判据，见 geocode() 里的注释。
+    //   调用方接受前会用 withoutPopulation() 剥掉，不会漏到对外的 place 对象上。
+    population: ranked[0].population,
   };
 }
+
+/** 剥掉仅供内部置信度判断的字段 */
+const withoutPopulation = ({ population, ...place }) => place;
 
 async function geocode(raw, { context, bias, signal } = {}) {
   const cacheKey = `geo:${normalizeName(raw) || raw.toLowerCase()}:${context?.province ?? ''}:${
@@ -318,7 +324,13 @@ async function geocode(raw, { context, bias, signal } = {}) {
   const fast = await withTimeout(fallbackPromise, FAST_GEOCODE_MS, 'fast geocode timeout').catch(
     () => undefined,
   );
-  if (fast) return cacheSet(cacheKey, fast);
+  // ★ 2026-11-17 修（主人实测「天门」被解析到黑龙江哈尔滨市天门）：
+  //   geocoding-api.open-meteo.com 里**根本没有湖北天门**——查 `天门` 返回 6 条同名结果，
+  //   全在黑龙江/山西/重庆/四川/甘肃，population 清一色 0。人口全 0 时排序退化，
+  //   于是第一条（黑龙江那个村子）就被当成答案。
+  //   Photon 那边 `天门市 / 湖北省` 恰好是第一条，所以：fast 结果人口为 0 = 不可信，
+  //   交给 Photon 走完整打分；Photon 也不行时再退回 fast（见下面的 fallback）。
+  if (fast && fast.population > 0) return cacheSet(cacheKey, withoutPopulation(fast));
 
   const collected = [];
   let sawForeign = false;
@@ -354,7 +366,7 @@ async function geocode(raw, { context, bias, signal } = {}) {
 
   if (collected.length === 0 && !sawForeign) {
     const fallback = await fallbackPromise;
-    if (fallback) return cacheSet(cacheKey, fallback);
+    if (fallback) return cacheSet(cacheKey, withoutPopulation(fallback));
   }
 
   if (!collected.length) {
