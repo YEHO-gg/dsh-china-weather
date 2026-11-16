@@ -271,7 +271,9 @@ function scoreFeature(feature, query, candidates, context, bias) {
 
   if (context) {
     const province = normalizeName(context.province);
-    if (province && fields.some((field) => field.includes(province))) score += 20;
+    // 省偏置只给"居民点"。否则「沙湖」这种湖泊会靠着 IP 在湖北 +20 分，
+    // 反过来压过外省真正的镇 —— 那是在回答一个没人问的湖。
+    if (rank > 0 && province && fields.some((field) => field.includes(province))) score += 20;
   }
 
   if (bias && Number.isFinite(bias.latitude) && Number.isFinite(bias.longitude)) {
@@ -424,6 +426,33 @@ async function geocodeAmap(raw, signal) {
   };
 }
 
+/**
+ * 「本机 IP 在哪个省」——用户没写省名时的兜底线索。
+ *
+ * 为什么需要：`天门`「朝阳」「建设」这种裸地名，全国有几十个同名的镇/村。
+ * 光靠「城市>镇>村」只能挑"最大的那个"，跟你实际在哪儿无关。
+ * 加一层 IP 省偏置之后，同名打平时会优先留在你所在的省。
+ *
+ * 只作为 +20 的加权，不会翻转"名字完全匹配"的候选（那有 100 分），
+ * 所以人在湖北问「北京朝阳区」不会被打成湖北。
+ *
+ * 拿不到就返回空串——绝不因为 IP 服务挂了就查不了天气。
+ */
+async function ipProvince(signal) {
+  const cached = cacheGet('ip:province');
+  if (cached !== undefined) return cached.value;
+
+  let value = '';
+  try {
+    const place = await detectIpLocation(signal);
+    value = detectProvince(place?.admin1 ?? place?.display ?? '');
+  } catch {
+    value = '';
+  }
+  cacheSet('ip:province', { value });
+  return value;
+}
+
 async function geocode(raw, { context, bias, signal } = {}) {
   const cacheKey = `geo:${normalizeName(raw) || raw.toLowerCase()}:${context?.province ?? ''}:${
     bias ? `${bias.latitude?.toFixed(1)},${bias.longitude?.toFixed(1)}` : ''
@@ -437,7 +466,14 @@ async function geocode(raw, { context, bias, signal } = {}) {
   // 用户输入里如果带了省名（「北京市朝阳区」「湖北省天门市」），那就是最硬的消歧线索：
   // 命中该省的候选 +20 分，且最终置信度直接判 high —— 人家已经说清楚了，不该再提示"有歧义"。
   const provinceHint = detectProvince(raw);
-  const effectiveContext = context ?? (provinceHint ? { province: provinceHint } : undefined);
+  let effectiveContext = context ?? (provinceHint ? { province: provinceHint } : undefined);
+
+  // ★ 没写省名就并行问一下本机 IP 在哪个省。
+  //   注意别 await ——快路径命中时根本用不到它，await 会白白多等 1 秒。
+  //   也不能在 detectIpLocation 里递归时触发：那条路径一定会带 context（见函数内）。
+  const ipProvincePromise = effectiveContext
+    ? Promise.resolve('')
+    : ipProvince(signal).catch(() => '');
 
   // ⓪ 高德（配了 AMAP_KEY 才走）：中国境内最准，直接采信。
   const amap = await geocodeAmap(raw, signal).catch(() => undefined);
@@ -462,6 +498,12 @@ async function geocode(raw, { context, bias, signal } = {}) {
       geocoder: 'open-meteo',
       confidence: fast.population >= 50_000 ? 'high' : 'medium',
     });
+  }
+
+  // 走到 Photon 这一层才真正需要 IP 省：快路径已经排除了"人口为 0 / 没命中"的情况。
+  if (!effectiveContext) {
+    const ipProv = await ipProvincePromise;
+    if (ipProv) effectiveContext = { province: ipProv };
   }
 
   const collected = [];
@@ -535,9 +577,12 @@ async function geocode(raw, { context, bias, signal } = {}) {
   //   两个同名地级市互不相让                     → 差 0  ⇒ low（提示带上省份）
   const runnerRank = runner ? runner.rank : 0;
   const rankLead = best.rank - runnerRank;
+  const strong = rankLead >= 10 || gap >= 40;   // 要么等级压制，要么总分甩开
+  const decent = rankLead >= 4 || gap >= 20;
   let confidence;
-  if (best.rank >= 26 && (rankLead >= 10 || gap >= 40)) confidence = 'high';
-  else if (best.rank >= 16 && (rankLead >= 4 || gap >= 25)) confidence = 'medium';
+  if (best.rank >= 26 && strong) confidence = 'high';
+  else if (best.rank >= 16 && strong) confidence = 'high';
+  else if (best.rank >= 8 && decent) confidence = 'medium';
   else confidence = 'low';
 
   // 用户自己写了省名、而且赢家确实在这个省 ⇒ 他都说清楚了，别再提示"有歧义"。
