@@ -37,6 +37,10 @@ const outputSchema = {
         resolvedBy: { type: 'string' },
       },
     },
+    weatherSource: {
+      type: 'string',
+      description: '这次预报用的是哪个数据源：china-weather（中国天气网）/ open-meteo / wttr。超时后会自动换下一个。',
+    },
     location: {
       type: 'object',
       additionalProperties: false,
@@ -120,7 +124,7 @@ const outputSchema = {
 const tool = {
   name: 'weather',
   description:
-    '查询中国境内（含港澳台）的实时天气与未来 1-7 天预报。省略 location 时自动按本机公网 IP 定位；也可指定地区——**请优先传「省+市/县」全称（如“湖北省天门市”）**，裸地名有同名歧义。返回实况（气温、体感、湿度、降水、风力）、日出日落、紫外线、逐日预报和空气质量，以及 location.geocoder（这次用的是哪个地理库）和 location.confidence（地名有多确定）。数据来自免费公开服务（Open-Meteo、Photon/OSM），无需 API 密钥；中国境外地区会返回错误。当用户询问天气、气温、下雨、穿衣或出行建议时优先调用。',
+    '查询中国境内（含港澳台）的实时天气与未来 1-7 天预报。省略 location 时自动按本机公网 IP 定位；也可指定地区——**请优先传「省+市/县」全称（如“湖北省天门市”）**，裸地名有同名歧义。返回实况（气温、体感、湿度、降水、风力）、日出日落、紫外线、逐日预报和空气质量，以及 location.geocoder（这次用的是哪个地理库）和 location.confidence（地名有多确定）。预报有多个数据源轮换：中国天气网（中央气象台体系，国内直连）→ Open-Meteo → wttr.in，一个超时就换下一个，返回里的 weatherSource 会写明这次用的是哪家；地名解析用 Photon/OSM。全部免费、无需 API 密钥。中国境外地区会返回错误。当用户询问天气、气温、下雨、穿衣或出行建议时优先调用。',
   parameters,
   output: {
     schema: outputSchema,

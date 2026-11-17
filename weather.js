@@ -16,6 +16,36 @@ const IPIP_ENDPOINT = 'https://myip.ipip.net/json';
 const IPWHO_ENDPOINT = 'https://ipwho.is/';
 
 /**
+ * 备用数据源（2026-11-17 加）。
+ *
+ * 起因：`api.open-meteo.com` 从国内只有一个 A 记录（51.81.167.44，OVH，RTT ~350ms），
+ * 实测 5 次里 2 次成功——TCP 443 会随机超时。插件原来没有重试，一次握手失败就直接
+ * 把 `fetch failed` 抛给模型，看起来像插件坏了，其实是单点线路抽风。
+ *
+ * 改法：预报改成"数据源轮换"，一个超时就换下一个，谁先答应用谁。
+ *   1. Open-Meteo    —— 有体感温度、紫外线、逐时，字段最全
+ *   2. 中国天气网     —— 中央气象台体系，国内直连，和手机天气 App 口径一致
+ *   3. wttr.in       —— 第三套基础设施，前面全挂时兜底
+ */
+const CN_SEARCH_ENDPOINT = 'http://toy1.weather.com.cn/search';
+const CN_SK_ENDPOINT = 'http://d1.weather.com.cn/sk_2d';
+const CN_PAGE_ENDPOINT = 'http://www.weather.com.cn/weather';
+const WTTR_ENDPOINT = 'https://wttr.in';
+
+const CN_HEADERS = {
+  'user-agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  referer: 'http://www.weather.com.cn/',
+  accept: 'application/json, text/html, */*',
+};
+
+/** 单次尝试的最长等待：超过就认定这条线路不通，换下一个源 */
+const PROVIDER_ATTEMPT_MS = 10_000;
+/** 刚失败的源，冷却期间直接跳过，省得每次都白等 7 秒 */
+const PROVIDER_COOLDOWN_MS = 5 * 60 * 1000;
+const providerCooldown = new Map();
+
+/**
  * 地名类型权重（2026-11-17 加）。
  *
  * 起因：`天门` 在 Photon 里能搜到 7 个同名条目，分别是
@@ -173,6 +203,20 @@ function withTimeout(promise, timeoutMs, message) {
     timer = setTimeout(() => reject(new Error(message)), timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** 失败重试一次：Photon 实测三次里只成一次，一次就放弃太亏。 */
+async function fetchJsonWithRetry(url, { attempts = 2, ...options } = {}) {
+  let lastError;
+  for (let index = 0; index < attempts; index += 1) {
+    try {
+      return await fetchJson(url, options);
+    } catch (error) {
+      lastError = error;
+      if (options.signal?.aborted) break;
+    }
+  }
+  throw lastError ?? new Error('请求失败');
 }
 
 async function fetchJson(url, { signal, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
@@ -520,7 +564,7 @@ async function geocode(raw, { context, bias, signal } = {}) {
         url.searchParams.set('lon', String(bias.longitude));
       }
 
-      const data = await fetchJson(url, { signal, timeoutMs: PHOTON_TIMEOUT_MS });
+      const data = await fetchJsonWithRetry(url, { signal, timeoutMs: PHOTON_TIMEOUT_MS });
       const features = Array.isArray(data?.features) ? data.features : [];
       if (features.some((feature) => !isChinaCode(feature.properties?.countrycode))) sawForeign = true;
 
@@ -718,11 +762,7 @@ async function detectIpLocation(signal) {
   return cacheSet('ip-location', value);
 }
 
-async function fetchForecast(place, days, signal) {
-  const key = `forecast:${place.latitude.toFixed(2)},${place.longitude.toFixed(2)}:${days}`;
-  const cached = cacheGet(key);
-  if (cached) return cached;
-
+async function openMeteoForecast(place, days, signal) {
   const url = new URL(FORECAST_ENDPOINT);
   url.searchParams.set('latitude', String(place.latitude));
   url.searchParams.set('longitude', String(place.longitude));
@@ -737,9 +777,391 @@ async function fetchForecast(place, days, signal) {
   url.searchParams.set('timezone', 'auto');
   url.searchParams.set('forecast_days', String(days));
 
-  const data = await fetchJson(url, { signal });
-  if (!data?.current || !data?.daily) throw new Error('天气服务返回的数据不完整，请稍后重试。');
-  return cacheSet(key, data);
+  const data = await fetchJson(url, { signal, timeoutMs: PROVIDER_ATTEMPT_MS });
+  if (!data?.current || !data?.daily) throw new Error('返回的数据不完整');
+  return { ...data, provider: 'open-meteo', providerLabel: 'Open-Meteo' };
+}
+
+/* ───────────────────────── 备用数据源 ───────────────────────── */
+
+function num(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  const parsed = Number.parseFloat(String(value ?? '').replace(/[^\d.\-]/g, ''));
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+async function fetchRaw(url, { signal, timeoutMs = REQUEST_TIMEOUT_MS, headers = CN_HEADERS } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('上游请求超时')), timeoutMs);
+  const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  try {
+    const response = await withTimeout(
+      fetch(url, { headers, signal: combined }),
+      timeoutMs,
+      '上游请求超时',
+    );
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 取文本并按内容猜编码。
+ *
+ * 中国天气网两个接口编码不一样：网页是 UTF-8，d1 的接口有的还是 GBK。
+ * 先按严格 UTF-8 解，解不动再退回 GBK——GBK 几乎什么字节都能"解成功"，
+ * 所以不能拿它当第一选择，否则 UTF-8 的中文会被解成乱码。
+ */
+async function fetchText(url, { charset = 'auto', ...options } = {}) {
+  const response = await fetchRaw(url, options);
+  const buffer = await response.arrayBuffer();
+  const labels = charset === 'auto' ? ['utf-8', 'gbk', 'gb2312'] : [charset, 'utf-8', 'gbk'];
+  for (const label of labels) {
+    try {
+      return new TextDecoder(label, { fatal: label.startsWith('utf-8') }).decode(buffer);
+    } catch {
+      // 换下一个编码
+    }
+  }
+  return new TextDecoder('utf-8').decode(buffer);
+}
+
+/** 北京时间的"今天 + offset 天"，返回 YYYY-MM-DD。 */
+function cnDateFor(offset) {
+  const beijing = new Date(Date.now() + 8 * 3600_000);
+  const target = new Date(
+    Date.UTC(beijing.getUTCFullYear(), beijing.getUTCMonth(), beijing.getUTCDate() + offset),
+  );
+  return target.toISOString().slice(0, 10);
+}
+
+/**
+ * 地名 → 中国天气网城市码（如 天门 → 101201501）。
+ * 走 toy1.weather.com.cn/search，必须带 Referer，否则返回空。
+ */
+async function chinaWeatherCode(place, signal) {
+  const key = `cn:code:${normalizeName(place?.name) || normalizeName(place?.display) || ''}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+
+  const province = detectProvince(`${place?.admin1 ?? ''}${place?.display ?? ''}`);
+  const names = [];
+  for (const raw of [place?.name, place?.admin2, place?.display]) {
+    const name = normalizeName(raw);
+    if (name && !names.includes(name)) names.push(name);
+  }
+
+  for (const name of names) {
+    let text = '';
+    for (let attempt = 0; attempt < 2 && !text; attempt += 1) {
+      try {
+        text = await fetchText(`${CN_SEARCH_ENDPOINT}?cityname=${encodeURIComponent(name)}`, {
+          signal,
+          timeoutMs: 6_000,
+        });
+      } catch {
+        // 这个源偶尔会空手而归，重试一次再说
+      }
+    }
+    if (!text) continue;
+    const start = text.indexOf('[');
+    const end = text.lastIndexOf(']');
+    if (start < 0 || end <= start) continue;
+    let list;
+    try {
+      list = JSON.parse(text.slice(start, end + 1));
+    } catch {
+      continue;
+    }
+    let best;
+    for (const entry of Array.isArray(list) ? list : []) {
+      // ref 形如 101201501~hubei~天门~Tianmen~天门~Tianmen~728~431700~TM~湖北
+      // 景点码带字母后缀（10122030102A），天气接口不认，直接排除。
+      const parts = String(entry?.ref ?? '').split('~');
+      const code = parts[0];
+      if (!/^\d{9,12}$/.test(code)) continue;
+      const nameCn = (parts[2] ?? '').trim();
+      const provinceCn = (parts[9] ?? '').trim();
+      let score = 0;
+      if (nameCn === name) score += 60;
+      else if (nameCn.startsWith(name)) score += 30;
+      else continue;
+      if (province && provinceCn && (provinceCn.includes(province) || province.includes(provinceCn))) {
+        score += 40;
+      }
+      if (!best || score > best.score) best = { code, score };
+    }
+    if (best) return cacheSet(key, best.code);
+  }
+  throw new Error('中国天气网没有收录这个地名');
+}
+
+/** 解析 7 天页面的 <li> 列表：天气文字 + 最高/最低温。 */
+function parseCnDaily(html, days) {
+  const anchor = html.indexOf('class="t clearfix"');
+  const scope = anchor >= 0 ? html.slice(anchor) : html;
+  const rows = [];
+  const re = /<li[^>]*class="sky[^"]*"[^>]*>([\s\S]*?)<\/li>/g;
+  let match;
+  while ((match = re.exec(scope)) && rows.length < days) {
+    const block = match[1];
+    const wea = (block.match(/class="wea"[^>]*>([^<]+)</) ?? [])[1];
+    if (!wea) continue;
+    const temBlock = (block.match(/class="tem"[^>]*>([\s\S]*?)<\/p>/) ?? [])[1] ?? '';
+    rows.push({
+      weather: wea.trim(),
+      high: num((temBlock.match(/<span>\s*(-?\d+)\s*℃/) ?? [])[1]),
+      low: num((temBlock.match(/<i>\s*(-?\d+)\s*℃/) ?? [])[1]),
+    });
+  }
+  return rows;
+}
+
+function parseCnSk(text) {
+  if (!text) return {};
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end <= start) return {};
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return {};
+  }
+}
+
+async function chinaWeatherForecast(place, days, signal) {
+  const code = await chinaWeatherCode(place, signal);
+  const [page, skText] = await Promise.all([
+    fetchText(`${CN_PAGE_ENDPOINT}/${code}.shtml`, {
+      signal,
+      timeoutMs: PROVIDER_ATTEMPT_MS,
+    }),
+    fetchText(`${CN_SK_ENDPOINT}/${code}.html`, {
+      signal,
+      timeoutMs: PROVIDER_ATTEMPT_MS,
+    }).catch(() => ''),
+  ]);
+
+  const rows = parseCnDaily(page, days);
+  if (!rows.length) throw new Error('页面里没解析出预报');
+
+  const sk = parseCnSk(skText);
+  const clock = /^\d{1,2}:\d{2}$/.test(String(sk?.time ?? '')) ? String(sk.time) : '00:00';
+  const hour = Number(clock.split(':')[0]);
+
+  const current = {
+    time: `${cnDateFor(0)}T${clock.padStart(5, '0')}`,
+    weather_text: typeof sk?.weather === 'string' ? sk.weather.trim() : undefined,
+    temperature_2m: num(sk?.temp),
+    relative_humidity_2m: num(String(sk?.SD ?? sk?.sd ?? '').replace('%', '')),
+    precipitation: num(sk?.rain),
+    wind_speed_10m: num(sk?.wse),
+    wind_text: typeof sk?.WD === 'string' ? sk.WD.trim() : undefined,
+    is_day: hour >= 6 && hour < 18 ? 1 : 0,
+  };
+
+  const base = {
+    current,
+    daily: {
+      time: rows.map((_, index) => cnDateFor(index)),
+      weather_text: rows.map((row) => row.weather),
+      weather_code: rows.map(() => undefined),
+      temperature_2m_max: rows.map((row) => row.high),
+      temperature_2m_min: rows.map((row) => row.low),
+    },
+    timezone: 'Asia/Shanghai',
+    provider: 'china-weather',
+    providerLabel: `中国天气网（中央气象台体系，城市码 ${code}）`,
+  };
+
+  // 中国天气网没有体感/紫外线/日出日落。Open-Meteo 顺手能拿到就补上，
+  // 拿不到（大概率是线路又抽风）也绝不拖慢主流程——最多等 3.5 秒。
+  const enrich = await withTimeout(
+    openMeteoForecast(place, days, signal),
+    3_500,
+    '补数据超时',
+  ).catch(() => undefined);
+  return enrich ? mergeEnrichment(base, enrich) : base;
+}
+
+/** 用 Open-Meteo 补齐中国天气网缺的字段，冲突时以中国天气网为准。 */
+function mergeEnrichment(base, extra) {
+  const current = { ...base.current };
+  const daily = { ...base.daily };
+  const fill = (target, source, key) => {
+    if (source?.[key] !== undefined) target[key] = source[key];
+  };
+
+  if (current.apparent_temperature === undefined) {
+    fill(current, extra?.current, 'apparent_temperature');
+  }
+  if (current.is_day === undefined) fill(current, extra?.current, 'is_day');
+  if (current.wind_direction_10m === undefined) {
+    fill(current, extra?.current, 'wind_direction_10m');
+  }
+
+  for (const key of [
+    'precipitation_probability_max',
+    'sunrise',
+    'sunset',
+    'uv_index_max',
+    'weather_code',
+  ]) {
+    if (daily[key] === undefined) fill(daily, extra?.daily, key);
+  }
+
+  // 今天的白天已经过完了，中国天气网就不给今天的高温了（只留低温）。
+  // 逐位补：只补空洞，不覆盖已有的数字。
+  for (const key of ['temperature_2m_max', 'temperature_2m_min']) {
+    const target = daily[key];
+    const source = extra?.daily?.[key];
+    if (!Array.isArray(target) || !Array.isArray(source)) continue;
+    daily[key] = target.map((value, index) =>
+      value === undefined && source[index] !== undefined ? source[index] : value,
+    );
+  }
+
+  return {
+    ...base,
+    current,
+    daily,
+    providerLabel: `${base.providerLabel} + Open-Meteo 补充体感/紫外线`,
+  };
+}
+
+/** wttr.in 只给英文天气描述，转一道；没收录的原样返回。 */
+const WTTR_TEXT = new Map([
+  ['sunny', '晴'], ['clear', '晴'], ['partly cloudy', '晴间多云'], ['cloudy', '多云'],
+  ['overcast', '阴'], ['mist', '薄雾'], ['fog', '雾'], ['freezing fog', '冻雾'],
+  ['haze', '霾'], ['smoky haze', '烟霾'], ['smoke', '烟霾'],
+  ['patchy rain nearby', '局部有雨'], ['patchy rain possible', '可能有雨'],
+  ['light drizzle', '毛毛雨'], ['patchy light drizzle', '零星毛毛雨'],
+  ['light rain', '小雨'], ['moderate rain', '中雨'], ['heavy rain', '大雨'],
+  ['light rain shower', '阵雨'], ['moderate or heavy rain shower', '中到大阵雨'],
+  ['patchy light rain', '零星小雨'], ['torrential rain shower', '暴雨'],
+  ['thundery outbreaks possible', '可能有雷阵雨'], ['patchy light rain with thunder', '雷阵雨'],
+  ['moderate or heavy rain with thunder', '强雷雨'],
+  ['light snow', '小雪'], ['moderate snow', '中雪'], ['heavy snow', '大雪'],
+  ['patchy snow possible', '可能有雪'], ['patchy light snow', '零星小雪'],
+  ['light snow showers', '阵雪'], ['blizzard', '暴风雪'], ['sleet', '雨夹雪'],
+  ['light sleet', '小雨夹雪'], ['moderate or heavy sleet', '中到大雨夹雪'],
+]);
+
+function wttrText(value) {
+  if (typeof value !== 'string') return undefined;
+  const cleaned = value.replace(/\s+/g, ' ').trim();
+  if (!cleaned) return undefined;
+  return WTTR_TEXT.get(cleaned.toLowerCase()) ?? cleaned;
+}
+
+/** "02:48 PM" / "6:55" / "14:03" → "14:48" / "06:55" / "14:03" */
+function clock24(value) {
+  const match = String(value ?? '').match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+  if (!match) return undefined;
+  let hour = Number(match[1]);
+  const minute = match[2];
+  const suffix = (match[3] ?? '').toUpperCase();
+  if (suffix === 'PM' && hour < 12) hour += 12;
+  if (suffix === 'AM' && hour === 12) hour = 0;
+  return `${String(hour).padStart(2, '0')}:${minute}`;
+}
+
+/** "14:48" + 8 小时 → "22:48"（跨零点按 24 小时回绕）。 */
+function shiftClock(clock, hours) {
+  if (!clock) return undefined;
+  const [rawHour, minute] = clock.split(':').map(Number);
+  const hour = (((rawHour + hours) % 24) + 24) % 24;
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+async function wttrForecast(place, days, signal) {
+  const url = `${WTTR_ENDPOINT}/${place.latitude.toFixed(3)},${place.longitude.toFixed(3)}?format=j1&lang=zh`;
+  const data = await fetchJson(url, { signal, timeoutMs: PROVIDER_ATTEMPT_MS });
+
+  const current = data?.current_condition?.[0];
+  const list = Array.isArray(data?.weather) ? data.weather.slice(0, days) : [];
+  if (!current || !list.length) throw new Error('返回的数据不完整');
+
+  const descOf = (item) =>
+    wttrText(item?.weatherDesc?.[0]?.value) ?? wttrText(item?.lang_zh?.[0]?.value);
+
+  const rainOf = (day) => {
+    const chances = (day?.hourly ?? [])
+      .map((hour) => num(hour?.chanceofrain))
+      .filter((value) => typeof value === 'number');
+    return chances.length ? Math.max(...chances) : undefined;
+  };
+
+  return {
+    current: {
+      // wttr 的 observation_time 是 UTC，转成北京时间再显示。
+      time: `${cnDateFor(0)}T${shiftClock(clock24(current.observation_time), 8) ?? clock24(new Date().toISOString().slice(11, 16))}`,
+      weather_text: descOf(current),
+      temperature_2m: num(current.temp_C),
+      apparent_temperature: num(current.FeelsLikeC),
+      relative_humidity_2m: num(current.humidity),
+      precipitation: num(current.precipMM),
+      wind_speed_10m: num(current.windspeedKmph),
+      wind_direction_10m: num(current.winddirDegree),
+      is_day: undefined,
+    },
+    daily: {
+      time: list.map((day) => day.date),
+      weather_text: list.map((day) => descOf(day?.hourly?.[4]) ?? descOf(day?.hourly?.[0])),
+      weather_code: list.map(() => undefined),
+      temperature_2m_max: list.map((day) => num(day.maxtempC)),
+      temperature_2m_min: list.map((day) => num(day.mintempC)),
+      precipitation_probability_max: list.map(rainOf),
+      sunrise: list.map((day) => clock24(day?.astronomy?.[0]?.sunrise)),
+      sunset: list.map((day) => clock24(day?.astronomy?.[0]?.sunset)),
+      uv_index_max: list.map((day) => num(day?.hourly?.[4]?.uvIndex)),
+    },
+    timezone: 'Asia/Shanghai',
+    provider: 'wttr',
+    providerLabel: 'wttr.in（World Weather Online 数据）',
+  };
+}
+
+// 顺序有讲究：中国天气网是唯一从国内稳定连得上的源（实测 0.1~1s），
+// 而且它的口径和手机天气 App 一致；Open-Meteo 有体感/紫外线但线路抽风，
+// 排在第二当补充/兜底；wttr.in 的线路也不稳，最后。
+const FORECAST_PROVIDERS = [
+  { name: 'china-weather', run: chinaWeatherForecast },
+  { name: 'open-meteo', run: openMeteoForecast },
+  { name: 'wttr', run: wttrForecast },
+];
+
+/** 预报主入口：按顺序试数据源，一个超时/失败就换下一个，谁先答应用谁。 */
+async function fetchForecast(place, days, signal) {
+  const key = `forecast:${place.latitude.toFixed(2)},${place.longitude.toFixed(2)}:${days}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+
+  const failures = [];
+  for (const provider of FORECAST_PROVIDERS) {
+    if ((providerCooldown.get(provider.name) ?? 0) > Date.now()) {
+      failures.push(`${provider.name}（冷却中）`);
+      continue;
+    }
+    try {
+      const data = await provider.run(place, days, signal);
+      providerCooldown.delete(provider.name);
+      return cacheSet(key, data);
+    } catch (error) {
+      // 「没收录这个地名」是这个地名的问题，不是这条线路挂了——
+      // 别让它把整个源冷却掉，否则查一次小地方，后面 5 分钟全都用不上它。
+      const dataMissing = /没有收录/.test(error?.message ?? '');
+      if (!dataMissing) {
+        providerCooldown.set(provider.name, Date.now() + PROVIDER_COOLDOWN_MS);
+      }
+      const reason = error?.name === 'AbortError' ? '超时' : (error?.message ?? '未知错误');
+      failures.push(`${provider.name}（${reason}）`);
+      if (signal?.aborted) break;
+    }
+  }
+  throw new Error(`所有天气数据源都失败了：${failures.join('、')}。请稍后重试。`);
 }
 
 async function fetchAirQuality(place, signal) {
@@ -782,11 +1204,16 @@ function aqiLevel(aqi) {
 function buildValue({ input, place, forecast, air }) {
   const current = forecast.current;
   const daily = forecast.daily;
+  const providerLabel = forecast.providerLabel ?? 'Open-Meteo';
+
+  // 备用源直接给中文天气文字（"多云转晴"这种没法反查 WMO 码），所以优先用文字。
+  const dayText = (index) =>
+    daily.weather_text?.[index] ?? weatherText(daily.weather_code?.[index]);
 
   const days = (daily.time ?? []).map((date, index) => ({
     date,
     weekday: weekdayOf(date),
-    weather: weatherText(daily.weather_code?.[index]),
+    weather: dayText(index),
     weatherCode: daily.weather_code?.[index],
     high: round1(daily.temperature_2m_max?.[index]),
     low: round1(daily.temperature_2m_min?.[index]),
@@ -798,6 +1225,7 @@ function buildValue({ input, place, forecast, air }) {
 
   return {
     query: { input: input ?? '', resolvedBy: place.source === 'ip' ? 'ip' : 'name' },
+    weatherSource: forecast.provider ?? 'open-meteo',
     location: {
       display: place.display,
       name: place.name ?? '',
@@ -813,20 +1241,20 @@ function buildValue({ input, place, forecast, air }) {
     note: place.note,
     current: {
       time: current.time,
-      weather: weatherText(current.weather_code),
+      weather: current.weather_text ?? weatherText(current.weather_code),
       weatherCode: current.weather_code,
       temperature: round1(current.temperature_2m),
       apparentTemperature: round1(current.apparent_temperature),
       humidity: round1(current.relative_humidity_2m),
       precipitation: round1(current.precipitation),
       windSpeed: round1(current.wind_speed_10m),
-      windDirection: windText(current.wind_direction_10m),
+      windDirection: current.wind_text ?? windText(current.wind_direction_10m),
       isDay: current.is_day === 1,
     },
     daily: days,
     airQuality: air ?? undefined,
     sources: [
-      'Open-Meteo（天气预报与空气质量，免费、无需密钥）',
+      `${providerLabel}（天气预报，免费、无需密钥）`,
       'Photon / OpenStreetMap（地名解析）',
       place.source === 'ip' ? 'ipip.net 与 ipwho.is（本机公网 IP 定位）' : '用户指定地区',
     ],
@@ -838,7 +1266,11 @@ function lineForDay(day, index) {
   const temperature =
     typeof day.high === 'number' && typeof day.low === 'number'
       ? `${day.high}/${day.low}°C`
-      : '气温未知';
+      : typeof day.high === 'number'
+        ? `最高 ${day.high}°C`
+        : typeof day.low === 'number'
+          ? `最低 ${day.low}°C`
+          : '气温未知';
   const pieces = [`${day.date} ${label}：${day.weather} ${temperature}`];
   if (typeof day.rainProbability === 'number') pieces.push(`降水概率 ${day.rainProbability}%`);
   if (day.sunrise && day.sunset) pieces.push(`日出 ${day.sunrise} / 日落 ${day.sunset}`);
@@ -886,7 +1318,8 @@ export function renderWeather(value) {
     photon: 'Photon / OpenStreetMap',
     'open-meteo': 'Open-Meteo',
   }[location.geocoder] ?? 'Open-Meteo / Photon';
-  lines.push('', `数据来源：天气 Open-Meteo，地名 ${geocoderLabel}（均免费）`);
+  const providerLabel = value.sources?.[0]?.replace(/（天气预报.*$/, '') ?? 'Open-Meteo';
+  lines.push('', `数据来源：天气 ${providerLabel}，地名 ${geocoderLabel}（均免费）`);
   return lines.join('\n');
 }
 
